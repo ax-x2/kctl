@@ -1,8 +1,12 @@
 [package]
 name = "kctl"
+license = "MIT"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A Linux kernel manager"
+
+repository = "https://github.com/ax-x2/kctl"
+homepage = "https://1000x.sh"
 
 [dependencies]
