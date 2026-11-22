@@ -11,6 +11,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Default)]
+pub struct Options {
+    hardware: bool,
+    skip_signature_check: bool,
+}
+
+impl Options {
+    pub fn parse(flags: &[&str]) -> Result<Self> {
+        let mut options = Self::default();
+        for flag in flags {
+            let value = match *flag {
+                "--hardware" => &mut options.hardware,
+                "--skip-signature-check" => &mut options.skip_signature_check,
+                _ => return Err(format!("unknown install option {flag}").into()),
+            };
+            if *value {
+                return Err(format!("duplicate install option {flag}").into());
+            }
+            *value = true;
+        }
+        Ok(options)
+    }
+}
+
 pub fn deps() -> Result {
     distro()?;
     let _host = host_lock()?;
@@ -39,6 +63,7 @@ pub fn deps() -> Result {
             "kmod",
             "curl",
             "jq",
+            "gzip",
             "xz-utils",
             "gpg",
             "ca-certificates",
@@ -62,6 +87,9 @@ fn distro() -> Result {
     Ok(())
 }
 pub fn precheck(c: &Config) -> Result<String> {
+    check_build_host(c, "xz", true)
+}
+fn check_build_host(c: &Config, decoder: &str, verify_signature: bool) -> Result<String> {
     distro()?;
     if out(&mut cmd("id", &["-u"]))? == "0" {
         return Err("run kctl as a normal user with sudo access".into());
@@ -74,8 +102,7 @@ pub fn precheck(c: &Config) -> Result<String> {
     for tool in [
         "curl",
         "tar",
-        "xz",
-        "gpg",
+        decoder,
         "timeout",
         "make",
         "gcc",
@@ -88,7 +115,10 @@ pub fn precheck(c: &Config) -> Result<String> {
         "rsync",
         "cpio",
         "pahole",
-    ] {
+    ]
+    .into_iter()
+    .chain(verify_signature.then_some("gpg"))
+    {
         if !std::env::split_paths(&search).any(|dir| dir.join(tool).is_file()) {
             return Err(format!("missing {tool}. Run kctl deps").into());
         }
@@ -152,17 +182,35 @@ fn fresh(r: &str) -> Result {
         }
     }
 }
-pub fn install(c: &Config, rel: Release, scan: bool) -> Result {
+fn archive_signature(rel: &Release, skip: bool) -> Result<Option<&str>> {
+    if skip {
+        return Ok(None);
+    }
+    match rel.signature.as_deref() {
+        Some(signature) if signature.ends_with(".tar.sign") => Ok(Some(signature)),
+        Some(_) => Err("expected a detached kernel.org archive signature".into()),
+        None => Err("upstream supplies no verifiable detached signature for this release. Pass --skip-signature-check to skip verification for a single install".into()),
+    }
+}
+
+pub fn install(c: &Config, rel: Release, options: Options) -> Result {
     PendingInstall::require_empty()?;
-    let signature = rel
-        .signature
-        .as_deref()
-        .ok_or("upstream supplies no verifiable detached signature for this release")?;
-    if !rel.url.ends_with(".tar.xz") || !signature.ends_with(".tar.sign") {
-        return Err("expected a kernel.org archive and detached archive signature".into());
+    let signature = archive_signature(&rel, options.skip_signature_check)?;
+    let decoder = if rel.url.ends_with(".tar.xz") {
+        "xz"
+    } else if rel.url.ends_with(".tar.gz") {
+        "gzip"
+    } else {
+        return Err("expected a .tar.xz or .tar.gz kernel.org archive".into());
+    };
+    if options.skip_signature_check {
+        eprintln!(
+            "warning: skipping upstream signature verification for {}",
+            rel.version
+        );
     }
     step(1, 6, "Check host, fallback and available space");
-    let conf = precheck(c)?;
+    let conf = check_build_host(c, decoder, signature.is_some())?;
     let running = current()?;
     let expected = rel.kernel_release()?;
     fresh(&expected)?;
@@ -170,11 +218,19 @@ pub fn install(c: &Config, rel: Release, scan: bool) -> Result {
         "Target  {}\nSource  {}\nDefault {running}",
         rel.version, rel.url
     );
-    step(2, 6, "Download and verify upstream source");
+    step(
+        2,
+        6,
+        if signature.is_some() {
+            "Download and verify upstream source"
+        } else {
+            "Download upstream source"
+        },
+    );
     let work = Temp::new(&home()?.join("work"))?;
     let src = work.0.join("source");
     fs::create_dir(&src)?;
-    let archive = verified_archive(&work.0, &rel.url, signature)?;
+    let archive = prepare_archive(&work.0, &rel.url, decoder, signature)?;
     run(&mut cmd(
         "tar",
         &[
@@ -210,7 +266,7 @@ pub fn install(c: &Config, rel: Release, scan: bool) -> Result {
     if r != expected {
         return Err(format!("source produced {r}, expected {expected}").into());
     }
-    if scan || c.hardware {
+    if options.hardware || c.hardware {
         crate::hardware::scan(&src)?
     }
     step(4, 6, "Build Debian image and headers");
@@ -268,32 +324,94 @@ pub fn install(c: &Config, rel: Release, scan: bool) -> Result {
     Ok(())
 }
 
-fn verified_archive(work: &Path, source: &str, signed_by: &str) -> Result<PathBuf> {
-    let verifier = keys::Verifier::load(work)?;
-    let compressed = work.join("source.tar.xz");
+fn prepare_archive(
+    work: &Path,
+    source: &str,
+    decoder: &str,
+    signature_url: Option<&str>,
+) -> Result<PathBuf> {
+    let compressed = work.join("source.compressed");
     let signature = work.join("source.tar.sign");
     let archive = work.join("source.tar");
-    crate::release::download(signed_by, &signature, 30, 64 * 1024)?;
+    let verifier = if let Some(url) = signature_url {
+        let verifier = keys::Verifier::load(work)?;
+        crate::release::download(url, &signature, 30, 64 * 1024)?;
+        Some(verifier)
+    } else {
+        None
+    };
     crate::release::download(source, &compressed, 15 * 60, 512 * MIB)?;
-    stream_stdout(
-        cmd(
-            "timeout",
-            &[
-                "--kill-after=5s",
-                "5m",
-                "xz",
-                "--memlimit-decompress=256MiB",
-                "-dc",
-                "--",
-                path(&compressed)?,
-            ],
-        )
-        .env_remove("XZ_OPT")
-        .env_remove("XZ_DEFAULTS"),
-        fs::File::create_new(&archive)?,
-        4 * 1024 * MIB,
-    )?;
+    decode_archive(&compressed, &archive, decoder)?;
     fs::remove_file(compressed)?;
-    verifier.verify(&signature, &archive)?;
+    if let Some(verifier) = verifier {
+        verifier.verify(&signature, &archive)?;
+    }
     Ok(archive)
+}
+
+fn decode_archive(compressed: &Path, archive: &Path, decoder: &str) -> Result {
+    let mut command = cmd("timeout", &["--kill-after=5s", "5m", decoder]);
+    if decoder == "xz" {
+        command.arg("--memlimit-decompress=256MiB");
+    }
+    stream_stdout(
+        command
+            .args(["-dc", "--", path(compressed)?])
+            .env_remove("XZ_OPT")
+            .env_remove("XZ_DEFAULTS")
+            .env_remove("GZIP"),
+        fs::File::create_new(archive)?,
+        4 * 1024 * MIB,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_verification_only_when_explicitly_requested() {
+        let candidate = crate::release::resolve("7.4-rc3").unwrap();
+        let stable = crate::release::resolve("6.18").unwrap();
+        let defaults = Options::parse(&[]).unwrap();
+        assert!(archive_signature(&candidate, defaults.skip_signature_check).is_err());
+        assert!(
+            archive_signature(&stable, defaults.skip_signature_check)
+                .unwrap()
+                .is_some()
+        );
+        for flags in [
+            ["--hardware", "--skip-signature-check"],
+            ["--skip-signature-check", "--hardware"],
+        ] {
+            let options = Options::parse(&flags).unwrap();
+            assert!(options.hardware);
+            assert!(
+                archive_signature(&candidate, options.skip_signature_check)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                archive_signature(&stable, options.skip_signature_check)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(Options::parse(&["--skip-signature-check", "--skip-signature-check"]).is_err());
+        assert!(Options::parse(&["--unknown"]).is_err());
+    }
+
+    #[test]
+    fn decodes_gzip_without_a_filename_suffix() {
+        let work = Temp::new(&std::env::temp_dir()).unwrap();
+        let payload = work.0.join("payload");
+        let compressed = work.0.join("source.compressed");
+        let decoded = work.0.join("source.tar");
+        fs::write(&payload, b"archive fixture").unwrap();
+        run(cmd("gzip", &["-c", "--", path(&payload).unwrap()])
+            .stdout(fs::File::create(&compressed).unwrap()))
+        .unwrap();
+        decode_archive(&compressed, &decoded, "gzip").unwrap();
+        assert_eq!(fs::read(decoded).unwrap(), b"archive fixture");
+    }
 }

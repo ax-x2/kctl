@@ -133,7 +133,7 @@ pub fn confirm(action: &str) -> Result {
     io::stdout().flush()?;
     let mut s = String::new();
     io::stdin().read_line(&mut s)?;
-    if s.trim() != "y" {
+    if !s.trim().eq_ignore_ascii_case("y") {
         return Err("cancelled".into());
     }
     Ok(())

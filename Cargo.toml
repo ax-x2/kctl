@@ -1,7 +1,7 @@
 [package]
 name = "kctl"
 license = "MIT"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "A Linux kernel manager"

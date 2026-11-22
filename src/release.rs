@@ -1,5 +1,7 @@
 use crate::system::*;
 use std::{fs::File, path::Path};
+const SNAPSHOT_ROOT: &str =
+    "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/";
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(u32, u32, u32, OptionKey);
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,9 +82,15 @@ pub fn catalog() -> Result<Vec<Release>> {
     parse_rows(&rows)
 }
 pub fn download(url: &str, dest: &Path, seconds: u32, limit: u64) -> Result {
-    if !["https://www.kernel.org/", "https://cdn.kernel.org/"]
-        .iter()
-        .any(|prefix| url.starts_with(prefix))
+    let mainline_snapshot = url
+        .strip_prefix(SNAPSHOT_ROOT)
+        .and_then(|name| name.strip_prefix("linux-"))
+        .and_then(|name| name.strip_suffix(".tar.gz"))
+        .and_then(version)
+        .is_some_and(|Version(_, _, _, stage)| matches!(stage, OptionKey::Rc(_)));
+    if !(mainline_snapshot
+        || url.starts_with("https://www.kernel.org/")
+        || url.starts_with("https://cdn.kernel.org/"))
         || url
             .bytes()
             .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
@@ -120,19 +128,23 @@ fn parse_rows(rows: &str) -> Result<Vec<Release>> {
         if v.len() != 5 {
             return Err("invalid release record".into());
         }
-        if version(v[1]).is_none() {
-            return Err("invalid release version".into());
-        }
+        let Version(_, _, _, stage) = version(v[1]).ok_or("invalid release version")?;
         if !v[3].starts_with("https://cdn.kernel.org/")
             && !v[3].starts_with("https://git.kernel.org/")
         {
             return Err("unexpected source URL in release feed".into());
         }
+        let url =
+            if matches!(stage, OptionKey::Rc(_)) && v[3].starts_with("https://git.kernel.org/") {
+                format!("{SNAPSHOT_ROOT}linux-{}.tar.gz", v[1])
+            } else {
+                v[3].into()
+            };
         list.push(Release {
             kind: v[0].into(),
             version: v[1].into(),
             eol: v[2].parse()?,
-            url: v[3].into(),
+            url,
             signature: (v[4] != "-").then(|| v[4].to_owned()),
         })
     }
@@ -171,7 +183,7 @@ pub fn resolve(s: &str) -> Result<Release> {
         }
         OptionKey::Rc(n) => {
             let rc = format!("{base}-rc{n}");
-            let url = format!("https://git.kernel.org/torvalds/t/linux-{rc}.tar.gz");
+            let url = format!("{SNAPSHOT_ROOT}linux-{rc}.tar.gz");
             (rc, url, None)
         }
     };
@@ -221,5 +233,18 @@ mod tests {
         for s in ["1", "../6.1", "6..1", "--help", "6.2.3.4"] {
             assert!(resolve(s).is_err())
         }
+    }
+
+    #[test]
+    fn candidate_sources_use_the_direct_kernel_org_snapshot() {
+        let rows = parse_rows(
+            "mainline\t7.4-rc3\tfalse\thttps://git.kernel.org/torvalds/t/linux-7.4-rc3.tar.gz\t-",
+        )
+        .unwrap();
+        let mainline = select(rows, "mainline").unwrap();
+        let explicit = resolve("7.4-rc3").unwrap();
+        assert_eq!(mainline.url, format!("{SNAPSHOT_ROOT}linux-7.4-rc3.tar.gz"));
+        assert_eq!(mainline.url, explicit.url);
+        assert!(mainline.signature.is_none());
     }
 }

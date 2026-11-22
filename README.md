@@ -1,5 +1,7 @@
 # kctl
 
+do not use in production.
+
 A Rust CLI for building upstream Linux kernels alongside an existing Debian or Ubuntu (for now) installation with GRUB 2 and initramfs-tools. Run it as your regular user with sudo access. It uses the Rust standard library and the distribution's system tools.
 
 ## First run on the target machine
@@ -28,11 +30,11 @@ kctl install latest-longterm
 kctl boot list
 ```
 
-Choose `stable`, `stable-eol`, `latest-longterm` or an explicit signed upstream version. The EOL channel requires a currently listed EOL stable release. You can inspect release candidates with `kctl kernels` and `kctl check mainline`. Installation requires a detached archive signature from kernel.org. [Upstream release catalog](https://www.kernel.org/releases.json)
+Choose `stable`, `stable-eol`, `latest-longterm` or an explicit upstream version. The EOL channel requires a currently listed EOL stable release. You can inspect release candidates with `kctl kernels` and `kctl check mainline`. Installation verifies a detached archive signature by default. To install a release candidate whose archive has no signature, pass `--skip-signature-check` to that invocation, for example `kctl install mainline --skip-signature-check`. The option also works with `--hardware`. [Upstream release catalog](https://www.kernel.org/releases.json)
 
-kctl verifies the decoded archive with GnuPG before extraction. The full primary fingerprints for Linus Torvalds, Greg Kroah-Hartman, Sasha Levin, and Ben Hutchings are visible in `src/keys.rs` and in `kctl keys status`. Compare them with kernel.org's published fingerprints. [Kernel.org signing keys and fingerprints](https://www.kernel.org/signature.html#_important_fingerprints)
+By default, kctl verifies the decoded archive with GnuPG before extraction. The full primary fingerprints for Linus Torvalds, Greg Kroah-Hartman, Sasha Levin, and Ben Hutchings are visible in `src/keys.rs` and in `kctl keys status`. Compare them with kernel.org's published fingerprints. [Kernel.org signing keys and fingerprints](https://www.kernel.org/signature.html#_important_fingerprints)
 
-`kctl keys refresh` fetches public keys directly from the kernel.org Web Key Directory and checks every fingerprint before replacing `~/.kctl/kernel-release-keyring.gpg`. It merges the cached keys to retain any known revocations. Run it before the first kernel install and again to pick up updated key material. A new primary fingerprint requires a reviewed kctl update.
+`kctl keys refresh` fetches public keys directly from the kernel.org Web Key Directory and checks every fingerprint before replacing `~/.kctl/kernel-release-keyring.gpg`. It merges the cached keys to retain any known revocations. Run it before the first verified kernel install and again to pick up updated key material. A new primary fingerprint requires a reviewed kctl update.
 
 The build copies the running configuration, clears distro-specific certificate paths, applies upstream defaults and builds versioned image and header packages as your user. The build log lives at `~/.kctl/build.log`. Prechecks cover the current boot files, expected mounts, EFI Secure Boot state, build tools and disk capacity. Debug-enabled distribution configs can consume much more than the 12 GiB minimum build-space check.
 
@@ -52,7 +54,7 @@ Default and one-shot selection use version-specific GRUB IDs. The persistent def
 ## Maintenance
 
 - `kctl check [CHANNEL]` compares the upstream version with the running kernel's upstream version. `kctl update [CHANNEL]` installs a newer release. Distro package revisions and backported patches are outside this comparison.
-- `kctl clean` previews old kernels. `kctl clean RELEASE` confirms the matching distro image package before removal, verifies a safe default and keeps another intact fallback. When space permits, kctl reserves space in `/boot/.kctl-grub-reserve` for GRUB regeneration and can reclaim it during low-space cleanup.
+- `kctl clean` previews old kernels. `kctl clean RELEASE` confirms the matching distro image package before removal, verifies a safe default and keeps another intact fallback. kctl can reclaim `/boot/.kctl-grub-reserve` during low-space cleanup. If ordinary free space is exhausted on an ext filesystem, cleanup tests whether root can allocate enough temporary space to pin the running kernel safely.
 - `kctl modules list` shows loaded modules. `modules available`, `modules activate NAME` and `modules setup NAME` list installed modules, load a module immediately and configure loading at boot, respectively.
 - `kctl hardware SOURCE` checks detected PCI and USB vendor/device pairs against common driver table macros in an extracted source tree. Use `kctl install stable --hardware` to scan before compilation. A match is a source hint. Class drivers, firmware, external modules and kernel config can affect actual support.
 - `kctl backup create [RELEASE]` saves the image, initramfs, config and System.map under `~/.kctl/backups/RELEASE` with SHA-256 checksums. These boot-file backups require the matching module tree to remain installed. Keep a separate disk backup for partition work.

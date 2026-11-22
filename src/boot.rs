@@ -1,4 +1,4 @@
-use crate::{config::Config, system::*};
+use crate::{config::Config, package, system::*};
 use std::{
     fs,
     io::{ErrorKind, Read},
@@ -298,6 +298,51 @@ fn reserve() -> Result<Option<fs::Metadata>> {
         Err(e) => Err(e.into()),
     }
 }
+fn remove_reserve() -> Result {
+    if reserve()?.is_some() {
+        sudo("rm", &["--", RESERVE])?;
+    }
+    Ok(())
+}
+fn allocate_reserve(needed: u64) -> Result {
+    if reserve()?.is_none() {
+        sudo("install", &["-m", "0600", "/dev/null", RESERVE])?;
+    }
+    sudo("fallocate", &["-l", &needed.to_string(), "--", RESERVE])?;
+    if !reserve()?.is_some_and(|m| m.blocks() * 512 >= needed) {
+        return Err("GRUB reserve was not fully allocated".into());
+    }
+    Ok(())
+}
+fn ext_free_bytes(stat: &str) -> Result<u64> {
+    let mut fields = stat.split_whitespace();
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some("ef53"), Some(block_size), Some(free), None) => block_size
+            .parse::<u64>()?
+            .checked_mul(free.parse()?)
+            .ok_or("boot filesystem free-space count overflow".into()),
+        (Some(_), Some(_), Some(_), None) => Ok(0),
+        _ => Err("unexpected boot filesystem statistics".into()),
+    }
+}
+fn verify_grub_headroom(needed: u64) -> Result {
+    if available(Path::new("/boot"))? >= needed {
+        return Ok(());
+    }
+    let stat = out(&mut cmd("stat", &["-f", "-c", "%t %S %f", "--", "/boot"]))?;
+    if ext_free_bytes(&stat)? < needed {
+        return Err(format!(
+            "free at least {} KiB for GRUB on /boot before cleanup can pin the running kernel",
+            needed.div_ceil(1024)
+        )
+        .into());
+    }
+    // Free ext filesystem blocks can include reserves unavailable even to root.
+    // Verify that the privileged writer can allocate the estimated headroom.
+    let probe = allocate_reserve(needed);
+    remove_reserve()?;
+    probe.map_err(|e| format!("could not allocate temporary space for GRUB on /boot: {e}").into())
+}
 fn provision_reserve(min_free: u64) -> Result {
     let needed = grub_headroom()?.max(4 * MIB);
     let existing = reserve()?;
@@ -308,13 +353,7 @@ fn provision_reserve(min_free: u64) -> Result {
     if available(Path::new("/boot"))? < min_free.saturating_add(needed) {
         return Err("insufficient space to reserve room for GRUB regeneration".into());
     }
-    if existing.is_none() {
-        sudo("install", &["-m", "0600", "/dev/null", RESERVE])?;
-    }
-    sudo("fallocate", &["-l", &needed.to_string(), "--", RESERVE])?;
-    if !reserve()?.is_some_and(|m| m.blocks() * 512 >= needed) {
-        return Err("GRUB reserve was not fully allocated".into());
-    }
+    allocate_reserve(needed)?;
     sudo("sync", &["-f", "--", RESERVE])
 }
 pub fn keep_reserve(c: &Config) {
@@ -377,15 +416,7 @@ pub fn clean(c: &Config, target: Option<&str>) -> Result {
             pkgs.push(p.as_str())
         }
     }
-    if !pkgs.is_empty()
-        && out(&mut cmd(
-            "dpkg-query",
-            &["-W", "-f=${db:Status-Status}", &headers],
-        ))
-        .ok()
-        .as_deref()
-            == Some("installed")
-    {
+    if !pkgs.is_empty() && package::state(&headers)? == package::State::Installed {
         pkgs.push(headers.as_str())
     }
     if pkgs.is_empty() {
@@ -397,15 +428,11 @@ pub fn clean(c: &Config, target: Option<&str>) -> Result {
     ))?;
     let already_pinned = default_selected(&running)? && next_entry(&environment()?)?.is_none();
     let headroom = grub_headroom()?;
-    if available(Path::new("/boot"))? < headroom && reserve()?.is_some() {
-        sudo("rm", &["--", RESERVE])?;
+    if available(Path::new("/boot"))? < headroom {
+        remove_reserve()?;
     }
     if !already_pinned {
-        if available(Path::new("/boot"))? < headroom {
-            return Err(
-                "free space on /boot before cleanup can safely pin the running kernel".into(),
-            );
-        }
+        verify_grub_headroom(headroom)?;
         set_default(&running)?;
     }
     // dpkg refuses unsatisfied reverse dependencies and never schedules additional removals.
@@ -492,5 +519,13 @@ mod cleanup_tests {
         assert!(!removable("running", "running", &menu, |_| true));
         assert!(!removable("old", "running", &menu, |v| v != "spare"));
         assert!(!removable("unknown", "running", &menu, |_| true));
+    }
+    #[test]
+    fn counts_free_ext_blocks_without_assuming_other_filesystems_have_a_reserve() {
+        assert_eq!(ext_free_bytes("ef53 4096 14080").unwrap(), 55 * MIB);
+        assert_eq!(ext_free_bytes("ef53 4096 0").unwrap(), 0);
+        assert_eq!(ext_free_bytes("9123683e 4096 14080").unwrap(), 0);
+        assert!(ext_free_bytes("ef53 4096").is_err());
+        assert!(ext_free_bytes("ef53 4096 18446744073709551615").is_err());
     }
 }

@@ -19,7 +19,7 @@ use system::*;
 const HELP: &str = "kctl  ·  Linux kernel manager for Debian and Ubuntu
 
 Usage   kctl COMMAND [ARGS]       kctl shell
-        kctl install latest-longterm|stable|stable-eol|VERSION
+        kctl install latest-longterm|stable|stable-eol|mainline|VERSION
 
 Inspect
   current                       Running kernel and /boot capacity
@@ -33,6 +33,7 @@ Build
   keys status                   Show pinned fingerprints and cached keys
   keys refresh                  Fetch and validate kernel.org signing keys
   install TARGET [--hardware]    Build and install alongside the running kernel
+      --skip-signature-check       Skip source signature verification for this install
   update [CHANNEL]              Install if upstream is newer than running
   clean [RELEASE]               List or remove an old packaged kernel
   clean-work                    Remove interrupted downloads and builds
@@ -129,7 +130,7 @@ fn dispatch(a: &[&str]) -> Result {
                         package::Readiness::Absent => {}
                     }
                 }
-                install::install(&c, r, false)?
+                install::install(&c, r, install::Options::default())?
             }
             Ok(())
         }
@@ -139,9 +140,10 @@ fn dispatch(a: &[&str]) -> Result {
             Ok(())
         }
         ["hardware", src] => hardware::scan(Path::new(src)),
-        ["install", target] | ["install", target, "--hardware"] => {
+        ["install", target, flags @ ..] => {
+            let options = install::Options::parse(flags)?;
             let _guard = lock()?;
-            install::install(&c, release::resolve(target)?, a.len() == 3)
+            install::install(&c, release::resolve(target)?, options)
         }
         ["deps"] => {
             let _guard = lock()?;
